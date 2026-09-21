@@ -14,6 +14,11 @@ import sys
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("USE_TF", "0")
 os.environ.setdefault("USE_TORCH", "1")
+# server._CFG["preload"] defaults to true (LAYA_PRELOAD unset), which preloads all three
+# checkpoints in the app's lifespan before the first request -- overriding it here is what
+# keeps this an "english only" test: every payload below is English, so lazy loading only
+# ever touches the one checkpoint this test actually needs.
+os.environ.setdefault("LAYA_PRELOAD", "0")
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -83,6 +88,14 @@ def main():
 
         r = client.post("/predict", json={"state": "hi", "questions": {"x": {"type": "bogus", "instructions": "?"}}})
         ok("POST /predict rejects unknown qtype with 422", r.status_code == 422, str(r.status_code))
+
+        # A choice/score question with no criteria used to reach laya.render_options and raise
+        # there (AttributeError on crit.items()), surfacing as a 500 instead of a validation
+        # error -- this is what the criteria-required model_validator on Question now catches.
+        r = client.post("/predict", json={"state": "hi", "questions": {"x": {"type": "choice", "instructions": "?"}}})
+        ok("POST /predict rejects choice with no criteria as 422, not 500", r.status_code == 422, str(r.status_code))
+        r = client.post("/predict", json={"state": "hi", "questions": {"x": {"type": "score", "instructions": "?"}}})
+        ok("POST /predict rejects score with no criteria as 422, not 500", r.status_code == 422, str(r.status_code))
 
         # /gui is the form-post path the builder JS uses -- this is what caught the
         # missing python-multipart dependency during manual verification.

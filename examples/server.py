@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import threading
 import time
 from contextlib import asynccontextmanager
 from html import escape
@@ -37,7 +38,7 @@ from typing import Any, Dict, List, Optional, Union
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic import ValidationError as PydanticValidationError
 
 import laya
@@ -68,10 +69,11 @@ class Question(BaseModel):
 
     type: str = Field(..., description="choice | score | noul | ... (see /qtypes)")
     instructions: str = Field(..., description="Natural-language prompt for the question")
-    criteria: Optional[Union[Dict[str, Optional[str]], List[str]]] = Field(
+    criteria: Optional[Union[Dict[str, Any], List[Any]]] = Field(
         default=None,
-        description="dict of label -> description (description may be omitted/None) for "
-                    "`choice`, ordered list for `score`",
+        description="dict of label -> description for `choice`, ordered list for `score`. "
+                    "A description may be any JSON value (laya.render_criterion accepts "
+                    "strings, numbers, lists and dicts, not just strings), or omitted/None.",
     )
 
     model_config = {"extra": "allow"}
@@ -83,6 +85,15 @@ class Question(BaseModel):
         if known and v not in known:
             raise ValueError(f"unknown question type {v!r}; expected one of {sorted(known)}")
         return v
+
+    @model_validator(mode="after")
+    def _criteria_required_for_choice_and_score(self) -> "Question":
+        # noul is the only current type laya answers without criteria (always [false, true]);
+        # missing criteria on choice/score reaches laya.render_options and raises AttributeError/
+        # IndexError there instead of failing validation here.
+        if self.type in ("choice", "score") and not self.criteria:
+            raise ValueError(f"'{self.type}' questions require non-empty `criteria`")
+        return self
 
 
 class PredictRequest(BaseModel):
@@ -124,6 +135,10 @@ class BatchRequest(BaseModel):
 # --------------------------------------------------------------------------- #
 
 ROUTER: Optional[Router] = None
+# FastAPI runs these sync `def` handlers concurrently in worker threads, but Router.load()/
+# _touch() mutate its _agents/_order cache without their own locking -- real under --no-preload
+# or max_loaded < 3, where a request can trigger a checkpoint load/eviction. Serialize access.
+_ROUTER_LOCK = threading.Lock()
 _CFG: Dict[str, Any] = {
     "preload": os.getenv("LAYA_PRELOAD", "1") not in ("0", "false", "False"),
     "device": os.getenv("LAYA_DEVICE") or None,
@@ -165,6 +180,12 @@ def _router() -> Router:
     return ROUTER
 
 
+def _predict(state: Any, questions: Dict[str, Any], **kw: Any) -> Dict[str, Any]:
+    """The one place that calls Router.predict -- see the _ROUTER_LOCK comment above."""
+    with _ROUTER_LOCK:
+        return _router().predict(state, questions, **kw)
+
+
 def _questions(model_map: Dict[str, Question]) -> Dict[str, Any]:
     """Back to the plain dicts laya expects, dropping unset keys."""
     return {k: v.model_dump(exclude_none=True) for k, v in model_map.items()}
@@ -200,7 +221,7 @@ def presets() -> Dict[str, Any]:
 @app.post("/predict")
 def predict(req: PredictRequest) -> Dict[str, Any]:
     try:
-        return _router().predict(
+        return _predict(
             req.state,
             _questions(req.questions),
             model=req.model,
@@ -217,12 +238,12 @@ def predict(req: PredictRequest) -> Dict[str, Any]:
 
 @app.post("/predict/batch")
 def predict_batch(req: BatchRequest) -> Dict[str, Any]:
-    router, questions = _router(), _questions(req.questions)
+    questions = _questions(req.questions)
     results: List[Dict[str, Any]] = []
     for i, state in enumerate(req.states):
         try:
             results.append(
-                router.predict(state, questions, model=req.model, task=req.task, lang=req.lang)
+                _predict(state, questions, model=req.model, task=req.task, lang=req.lang)
             )
         except Exception as exc:
             results.append({"index": i, "error": f"{type(exc).__name__}: {exc}"})
@@ -482,15 +503,16 @@ def _verdict(label: str, pct: float) -> str:
 
 
 _CELLS = 18  #: width of the ascii distribution meter
+_BLOCK = "\u2588"
+_DOT = "\u00b7"
 
 
 def _dist(pct: float) -> str:
     """A blocky meter: filled cells for the mass, dots for the rest."""
     filled = int(round(max(0.0, min(100.0, pct)) / 100 * _CELLS))
-    return (
-        f"<span class='blocks'>{'\u2588' * filled}</span>"
-        f"<span class='dots'>{'\u00b7' * (_CELLS - filled)}</span>"
-    )
+    blocks = _BLOCK * filled
+    dots = _DOT * (_CELLS - filled)
+    return f"<span class='blocks'>{blocks}</span><span class='dots'>{dots}</span>"
 
 
 def _criteria_legend(question: Dict[str, Any], rows: List[tuple]) -> str:
@@ -701,8 +723,11 @@ function addField(k, v) {
 
 /* ---------- questions ---------- */
 function critToText(q) {
+  /* v == null (missing/None) round-trips as a bare label -- textToCrit reads a line with no
+     ":" back as an empty description, matching the server's None. Without this, JS string
+     concatenation turns a real null into the literal text "null". */
   if (q.type === "choice" && q.criteria)
-    return Object.entries(q.criteria).map(([k, v]) => k + ": " + v).join("\n");
+    return Object.entries(q.criteria).map(([k, v]) => v == null || v === "" ? k : k + ": " + v).join("\n");
   if (q.type === "score" && q.criteria) return (q.criteria || []).join("\n");
   return "";
 }
@@ -784,12 +809,14 @@ function fill(p) {
 }
 
 /* ---------- tabs ---------- */
-function show(tab, err) {
+function show(tab, err, skipSync) {
   const cur = document.body.dataset.tab;      /* undefined on first paint */
-  if (cur === "build" && tab === "raw") $("#raw").value = JSON.stringify(collect(), null, 2);
-  if (cur === "raw" && tab === "build") {
-    try { fill(JSON.parse($("#raw").value)); }
-    catch (e) { $("#err").textContent = "Raw JSON is not valid: " + e.message; return; }
+  if (!skipSync) {
+    if (cur === "build" && tab === "raw") $("#raw").value = JSON.stringify(collect(), null, 2);
+    if (cur === "raw" && tab === "build") {
+      try { fill(JSON.parse($("#raw").value)); }
+      catch (e) { $("#err").textContent = "Raw JSON is not valid: " + e.message; return; }
+    }
   }
   $("#pane-build").hidden = tab !== "build";
   $("#pane-raw").hidden = tab !== "raw";
@@ -825,7 +852,9 @@ window.addEventListener("DOMContentLoaded", () => {
   /* .tabs .tab only: the nav's theme pill is also a .tab and must keep its own handler */
   for (const b of document.querySelectorAll(".tabs .tab")) b.onclick = () => show(b.dataset.t);
   for (const b of document.querySelectorAll(".preset-btn")) {
-    b.onclick = () => { fill(PRESETS[b.dataset.preset]); show("build"); };
+    /* skipSync=true: switch to the build tab without show()'s raw-textarea sync first,
+       which would otherwise immediately overwrite the preset with stale/unrelated raw JSON. */
+    b.onclick = () => { show("build", null, true); fill(PRESETS[b.dataset.preset]); };
   }
   show("build");
 });
@@ -1026,7 +1055,7 @@ async def gui_predict(request: Request) -> HTMLResponse:
     questions = _questions(req.questions)
     try:
         started = time.perf_counter()
-        res = _router().predict(
+        res = _predict(
             req.state, questions, model=req.model, task=req.task, lang=req.lang
         )
         res["_elapsed"] = time.perf_counter() - started
@@ -1100,6 +1129,17 @@ def main() -> None:
         default=args.default_model,
         max_loaded=args.max_loaded,
     )
+
+    if args.reload:
+        # With reload=True, Uvicorn re-imports "server:app" fresh in a separate reloader
+        # process; the _CFG.update() above never reaches that process, only the module-level
+        # os.getenv() defaults do. Push the resolved config through those same env vars so the
+        # reimport picks up what was actually asked for on the command line.
+        os.environ["LAYA_PRELOAD"] = "1" if _CFG["preload"] else "0"
+        os.environ["LAYA_DEFAULT_MODEL"] = _CFG["default"]
+        os.environ["LAYA_MAX_LOADED"] = str(_CFG["max_loaded"])
+        if _CFG["device"]:
+            os.environ["LAYA_DEVICE"] = _CFG["device"]
 
     import uvicorn
 
