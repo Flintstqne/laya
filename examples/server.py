@@ -30,7 +30,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import threading
 import time
 from contextlib import asynccontextmanager
 from html import escape
@@ -135,10 +134,6 @@ class BatchRequest(BaseModel):
 # --------------------------------------------------------------------------- #
 
 ROUTER: Optional[Router] = None
-# FastAPI runs these sync `def` handlers concurrently in worker threads, but Router.load()/
-# _touch() mutate its _agents/_order cache without their own locking -- real under --no-preload
-# or max_loaded < 3, where a request can trigger a checkpoint load/eviction. Serialize access.
-_ROUTER_LOCK = threading.Lock()
 _CFG: Dict[str, Any] = {
     "preload": os.getenv("LAYA_PRELOAD", "1") not in ("0", "false", "False"),
     "device": os.getenv("LAYA_DEVICE") or None,
@@ -181,9 +176,13 @@ def _router() -> Router:
 
 
 def _predict(state: Any, questions: Dict[str, Any], **kw: Any) -> Dict[str, Any]:
-    """The one place that calls Router.predict -- see the _ROUTER_LOCK comment above."""
-    with _ROUTER_LOCK:
-        return _router().predict(state, questions, **kw)
+    """The one place that calls Router.predict.
+
+    No lock needed here: Router's own model lifecycle (load/evict/LRU) is thread-safe as of
+    laya 0.3.5 (fixes #95), and inference is deliberately left outside Router's internal lock
+    so concurrent predictions aren't serialised. Locking around this call would undo that.
+    """
+    return _router().predict(state, questions, **kw)
 
 
 def _questions(model_map: Dict[str, Question]) -> Dict[str, Any]:
