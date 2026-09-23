@@ -159,7 +159,7 @@ a request builder (or a raw-JSON paste box) that renders `choice`/`score`/`noul`
 0-100 bars, plus a plain JSON API (`/predict`, `/predict/batch`) for scripting against.
 
 ```bash
-pip install "laya[server]"
+pip install "laya[serve]"
 python examples/server.py               # http://127.0.0.1:8000
 ```
 

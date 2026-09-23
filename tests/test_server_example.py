@@ -36,7 +36,7 @@ def main():
     try:
         from fastapi.testclient import TestClient
     except ImportError:
-        print("SKIP: fastapi/httpx not installed -- pip install laya[server] httpx")
+        print("SKIP: fastapi/httpx not installed -- pip install laya[serve] httpx")
         return 0
 
     import server  # examples/server.py
