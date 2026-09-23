@@ -360,7 +360,7 @@ the [`hs-jev`](https://github.com/getmissionctrl/hs-jev) Haskell client — just
 needs its `baseUrl` repointed; nothing else changes.
 
 ```bash
-pip install "laya[serve]"          # adds fastapi + uvicorn
+pip install "laya[serve]"          # adds fastapi + uvicorn + python-multipart
 LAYA_DEVICE=cuda LAYA_PRELOAD=1 laya-serve   # binds 0.0.0.0:8000, preloads all 3 checkpoints
 ```
 
